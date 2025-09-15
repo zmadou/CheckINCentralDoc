@@ -1,13 +1,44 @@
+# -*- coding: utf-8 -*-
+"""
+Verificador de documentos (corrigido e aprimorado)
+
+Recursos:
+- Anti-duplicidade (entrada e saída)
+- Retentativa automática de IDs que falharam
+- Auditoria final (duplicados na entrada e faltantes)
+- Colunas fixas F..I com rótulos padronizados e "Pendente" quando ausentes
+- "Mostrar Mais → Todos" apenas dentro da página de documentos
+- Evita inserir linhas parciais em caso de erro
+- RUN_LOG (aba no RESULTADO.xlsx) com o que foi gravado/pulado/erros
+
+Requisitos:
+- Selenium (chromedriver compatível com seu Chrome)
+- openpyxl
+- ALUNOS.xlsx com cabeçalho nas 3 primeiras colunas: Nome | ID | CPF
+- RESULTADO.xlsx será criado/atualizado automaticamente
+"""
+
+import os
 import re
 import time
 from collections import OrderedDict
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from openpyxl import load_workbook, Workbook
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver import ActionChains
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
+
+# ================== FUNÇÕES UTIL ==================
+def norm_id(x) -> str:
+    """Normaliza ID para dígitos apenas (string)."""
+    if x is None:
+        return ""
+    s = str(x).strip()
+    return re.sub(r'\D', '', s)
 
 # ================== ENTRADA ==================
 documento = input("digite o nome do documento: ").strip()
@@ -15,6 +46,18 @@ documento = input("digite o nome do documento: ").strip()
 # Planilha de alunos (entrada)
 excel = load_workbook('ALUNOS.xlsx')
 listaDeAlunos = excel['Planilha1']
+
+# Coletar IDs e detectar duplicados na entrada (normalizados)
+ids_entrada_norm = []
+duplicados_entrada_norm = set()
+for r in listaDeAlunos.iter_rows(min_row=2, values_only=True):
+    _id = norm_id(r[1] if len(r) > 1 else None)
+    if not _id:
+        continue
+    if _id in ids_entrada_norm:
+        duplicados_entrada_norm.add(_id)
+    ids_entrada_norm.append(_id)
+ids_entrada_unicos_norm = list(OrderedDict.fromkeys(ids_entrada_norm).keys())  # preserva ordem
 
 # ================== PLANILHA DE SAÍDA ==================
 OUT_PATH = 'RESULTADO.xlsx'
@@ -34,26 +77,62 @@ except Exception:
         COL_FIXA_F, COL_FIXA_G, COL_FIXA_H, COL_FIXA_I, 'Documento 1'
     ])
 
+# RUN_LOG para rastrear a execução
+if 'RUN_LOG' not in wb_out.sheetnames:
+    wb_out.create_sheet('RUN_LOG')
+ws_log = wb_out['RUN_LOG']
+if ws_log.max_row in (0, 1):
+    ws_log.append(['Ordem', 'ID requisitado', 'ID capturado', 'Nome', 'Ação', 'Obs'])
+
+def salvar_resultado_com_retry(max_tries=5, wait=0.4):
+    for _ in range(max_tries):
+        try:
+            wb_out.save(OUT_PATH)
+            return True
+        except Exception:
+            time.sleep(wait)
+    print("⚠️ Não consegui salvar RESULTADO.xlsx após várias tentativas (pode estar aberto no Excel/OneDrive).")
+    return False
+
+# Conjunto de IDs já processados no RESULTADO.xlsx (normalizados a dígitos)
+processados_saida_norm = set()
+for row in ws_out.iter_rows(min_row=2, values_only=True):
+    _id = norm_id(row[1])
+    if _id:
+        processados_saida_norm.add(_id)
+
+# Acumuladores
+ids_falha_norm = []        # IDs normalizados que falharam nesta rodada
+ids_ok_norm = set()        # IDs normalizados concluídos com sucesso (desta execução)
+vistos_execucao_norm = set()  # vistos nesta execução (pula duplicados da entrada)
+
 # ================== SELENIUM ==================
 driver = webdriver.Chrome()
 driver.set_window_size(1440, 900)  # evita layout mobile/accordion
 driver.get('https://www.intranet.sp.senac.br/home')
 
 def colocar_assim_aparecer(tipo, nome, conteudo, timeout=15):
+    elemento = WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((tipo, nome))
+    )
+    # Click e limpeza agressiva (resolve casos em que .clear() falha)
     try:
-        elemento = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((tipo, nome))
-        )
-        try:
-            elemento.clear()
-        except Exception:
-            pass
-        elemento.send_keys(str(conteudo))
-        print("✅ Conteúdo inserido com sucesso.")
-        return elemento
-    except Exception as e:
-        print(f"Erro ao inserir conteúdo '{conteudo}': {e}")
-        raise
+        elemento.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", elemento)
+    try:
+        elemento.clear()
+    except Exception:
+        pass
+    try:
+        # Windows: CTRL+A + DEL
+        elemento.send_keys(Keys.CONTROL, 'a')
+        elemento.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+    elemento.send_keys(str(conteudo))
+    print("✅ Campo de busca limpo e preenchido.")
+    return elemento
 
 def clicar_assim_aparecer(tipo, nome, timeout=15):
     try:
@@ -70,7 +149,7 @@ def clicar_assim_aparecer(tipo, nome, timeout=15):
         print(f"Erro ao clicar no elemento {nome}: {e}")
         raise
 
-# ================== NAVEGAÇÃO INICIAL (como no seu script) ==================
+# ================== NAVEGAÇÃO INICIAL ==================
 clicar_assim_aparecer(By.XPATH, '/html/body/header/section/nav/ul/li[1]/a')
 clicar_assim_aparecer(By.XPATH, '//*[@id="listagemPessoas"]/div/div[5]/div/div/div[2]/div/div[1]/div[1]/a')
 
@@ -84,13 +163,22 @@ clicar_assim_aparecer(By.XPATH, '//*[@id="item_10282CD6E9BF8D4E23F68971406D4AA4"
 
 # ================== HELPERS ==================
 def voltar_para_pesquisa(timeout=20):
-    """Volta ao formulário de busca e espera o campo ficar clicável."""
+    """Volta ao formulário de busca e espera o campo ficar clicável e a grade resetar."""
     try:
         clicar_assim_aparecer(By.XPATH, '//*[@id="app"]/div/div/div[1]/div/div[2]/div[1]/button[2]/div', timeout=timeout)
         clicar_assim_aparecer(By.XPATH, '//*[@id="item_10282CD6E9BF8D4E23F68971406D4AA4"]/div/li/a/span', timeout=timeout)
     except Exception:
         pass
-    WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[data-v-bc1d237e]')))
+    WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[data-v-bc1d237e]'))
+    )
+    # aguarda tabela anterior “sumir”, evitando clique na grid ainda carregada
+    try:
+        WebDriverWait(driver, 4).until_not(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '#sn-table-desk tbody tr'))
+        )
+    except Exception:
+        pass
 
 def estou_na_pagina_documentos(timeout=2):
     try:
@@ -103,24 +191,16 @@ def estou_na_pagina_documentos(timeout=2):
 
 def clicar_visualizar_primeira_linha(timeout=20, tentativas=3):
     """Clica no botão Visualizar da primeira linha da grade de busca."""
-    # espera pelo menos 1 linha na grid
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, '#sn-table-desk tbody tr'))
     )
-
     seletores = [
-        # 1) botão de ação padrão
         (By.XPATH, '//*[@id="sn-table-desk"]/tbody/tr[1]/td[4]//button'),
-        # 2) por data-cy
         (By.CSS_SELECTOR, '#sn-table-desk tbody tr:nth-child(1) td:nth-child(4) button[data-cy="read"]'),
-        # 3) por ícone alt
         (By.XPATH, '//*[@id="sn-table-desk"]/tbody/tr[1]/td[4]//button[.//img[@alt="Visualizar"]]'),
-        # 4) por ícone pelo nome do arquivo do SVG
         (By.XPATH, '//*[@id="sn-table-desk"]/tbody/tr[1]/td[4]//button[.//img[contains(@src,"search-sm-3329cf7e.svg")]]'),
-        # 5) seletor amplo (qualquer linha)
         (By.XPATH, '//*[@id="sn-table-desk"]/tbody/tr/td[4]/button'),
     ]
-
     for _ in range(tentativas):
         for by, sel in seletores:
             try:
@@ -130,8 +210,6 @@ def clicar_visualizar_primeira_linha(timeout=20, tentativas=3):
                     btn.click()
                 except Exception:
                     driver.execute_script("arguments[0].click();", btn)
-
-                # confirma que entrou na página de documentos
                 if estou_na_pagina_documentos(timeout=6):
                     print("✅ Entrou na página de documentos.")
                     return True
@@ -140,7 +218,6 @@ def clicar_visualizar_primeira_linha(timeout=20, tentativas=3):
             except (ElementClickInterceptedException, StaleElementReferenceException):
                 time.sleep(0.5)
                 continue
-
     raise TimeoutException("Não foi possível clicar em 'Visualizar'.")
 
 def abrir_dropdown_todos_documentos(timeout=12):
@@ -149,18 +226,15 @@ def abrir_dropdown_todos_documentos(timeout=12):
         return
     try:
         btn = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((
-            By.XPATH,
-            '//div[contains(@class,"dropdown")][.//span[normalize-space()="Mostrar Mais"]]//button'
+            By.XPATH, '//div[contains(@class,"dropdown")][.//span[normalize-space()="Mostrar Mais"]]//button'
         )))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
         try:
             btn.click()
         except Exception:
             driver.execute_script("arguments[0].click();", btn)
-
         menu = WebDriverWait(driver, timeout).until(EC.visibility_of_element_located((
-            By.XPATH,
-            '//div[contains(@class,"dropdown")][.//span[normalize-space()="Mostrar Mais"]]//ul[contains(@class,"options")]'
+            By.XPATH, '//div[contains(@class,"dropdown")][.//span[normalize-space()="Mostrar Mais"]]//ul[contains(@class,"options")]'
         )))
         opc_todos = menu.find_element(By.XPATH, './/a[normalize-space()="Todos"]')
         try:
@@ -193,6 +267,14 @@ def _get_text_by_label(driver, label, timeout=10):
     el = WebDriverWait(driver, timeout).until(EC.visibility_of_element_located((By.XPATH, xp_mob)))
     return el.text.strip()
 
+def _doc_base_name(s: str) -> str:
+    """Remove ' | Revisão: X' e sufixos ' - ...' para agrupar variantes."""
+    if not s:
+        return ''
+    s = re.sub(r'\s*\|\s*Revis[aã]o:\s*\d+\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = s.split(' - ')[0].strip()
+    return s
+
 def _parse_docs_desktop(driver):
     docs = []
     rows = driver.find_elements(By.CSS_SELECTOR, '#sn-table-desk tbody tr')
@@ -223,16 +305,13 @@ def _parse_docs_mobile(driver):
 
 def scrape_prontuario(driver, timeout=15):
     garantir_pagina_prontuario(timeout=timeout)
-    # título da página deve indicar documentos
     WebDriverWait(driver, timeout).until(
         EC.visibility_of_element_located((By.XPATH, '//h2[normalize-space()="Documentos do Prontuário Educacional"]'))
     )
-
     nome   = _get_text_by_label(driver, 'Nome', timeout)
     cpf    = _get_text_by_label(driver, 'CPF', timeout)
     emplid = _get_text_by_label(driver, 'EMPLID', timeout)
     total  = _get_text_by_label(driver, 'Total de Documentos', timeout)
-
     documentos = []
     try:
         WebDriverWait(driver, 4).until(EC.visibility_of_element_located((By.CSS_SELECTOR, '#sn-table-desk')))
@@ -243,76 +322,76 @@ def scrape_prontuario(driver, timeout=15):
             documentos = _parse_docs_mobile(driver)
         except Exception:
             documentos = []
-
     return {"nome": nome, "id": emplid, "cpf": cpf, "total_documentos": total, "documentos": documentos}
 
-# ================== NORMALIZAÇÃO / AGRUPAMENTO ==================
-REV_REGEX = re.compile(r'\s*\|\s*Revis[aã]o:\s*\d+\s*$', re.IGNORECASE)
-
-def normaliza_titulo(t):
-    if not t:
-        return ''
-    t = REV_REGEX.sub('', t).strip()
-    return t
-
+# ================== AGRUPAMENTO DE DOCUMENTOS ==================
 def so_digitos(s):
     m = re.search(r'\d+', s or '')
     return int(m.group()) if m else 0
 
 def agrega_docs(docs):
-    """Lista agregada com contagem (X) para repetidos."""
     ordem = OrderedDict()
     for d in docs:
-        nome = normaliza_titulo(d.get('tipo', ''))
-        if not nome:
+        nome_base = _doc_base_name(d.get('tipo', ''))
+        if not nome_base:
             continue
-        ordem[nome] = ordem.get(nome, 0) + 1
+        ordem[nome_base] = ordem.get(nome_base, 0) + 1
     saida = []
     for nome, qtd in ordem.items():
         saida.append(f"{nome} ({qtd})" if qtd > 1 else nome)
-    return saida, ordem  # também devolve o dicionário p/ checagem rápida
+    return saida, ordem
 
 def status_pesquisa(doc_pesquisado, lista_docs_normalizados):
-    alvo = normaliza_titulo(doc_pesquisado).casefold()
-    return "OK" if any(normaliza_titulo(x).casefold() == alvo for x in lista_docs_normalizados) else "Não Encontrado"
+    alvo = _doc_base_name(doc_pesquisado).casefold()
+    return "OK" if any(_doc_base_name(x).casefold() == alvo for x in lista_docs_normalizados) else "Não Encontrado"
 
 def garantir_cabecalho_docs(n_docs_extra):
-    """Garante cabeçalhos 'Documento N' a partir da coluna J (índice 10)."""
     headers = [cell.value for cell in ws_out[1]]
-    base_fixas = 9  # A..E + F..I = 9 colunas antes dos extras
-    num_atual = max(0, len(headers) - (base_fixas))
+    base_fixas = 9
+    num_atual = max(0, len(headers) - base_fixas)
     if n_docs_extra > num_atual:
         for i in range(num_atual + 1, n_docs_extra + 1):
             ws_out.cell(row=1, column=base_fixas + i, value=f"Documento {i}")
 
-# ================== LOOP PRINCIPAL ==================
+# ================== LOOP PRINCIPAL (Rodada 1) ==================
 for row in listaDeAlunos.iter_rows(min_row=2, max_row=listaDeAlunos.max_row, min_col=1, max_col=listaDeAlunos.max_column):
-    current_id = row[1].value
-    if not current_id:
+    current_nome = row[0].value
+    current_id_raw = row[1].value
+    current_cpf = row[2].value if len(row) >= 3 else None
+
+    nid = norm_id(current_id_raw)
+    if not nid:
         print("Linha com ID vazio. Pulando.")
+        continue
+
+    # Pular duplicados da entrada já vistos nesta execução
+    if nid in vistos_execucao_norm:
+        print(f"↪️ Duplicado na entrada (mesma execução): {nid}. Pulando antes do Selenium.")
+        continue
+
+    # Pular se já está feito no RESULTADO.xlsx
+    if nid in processados_saida_norm:
+        print(f"↪️ ID {nid} já consta no RESULTADO.xlsx. Pulando para evitar duplicidade.")
+        vistos_execucao_norm.add(nid)
         continue
 
     try:
         # BUSCA PELO EMPLID
-        colocar_assim_aparecer(By.CSS_SELECTOR, 'input[data-v-bc1d237e]', current_id)
+        colocar_assim_aparecer(By.CSS_SELECTOR, 'input[data-v-bc1d237e]', nid)
         clicar_assim_aparecer(By.XPATH, '//*[@id="app"]/div/div/div[2]/main/div/div/div[2]/div/div[1]/div/button')
 
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '#sn-table-desk tbody tr'))
         )
 
-        # CLICA VISUALIZAR (na grid de busca)
         clicar_visualizar_primeira_linha(timeout=20)
-
-        # AGORA SIM: “Mostrar Mais → Todos” NA PÁGINA DE DOCUMENTOS
         abrir_dropdown_todos_documentos(timeout=12)
 
-        # EXTRAI DADOS
         info = scrape_prontuario(driver, timeout=15)
 
-        # PREPARA SAÍDA
         nome = info['nome']
         em = info['id']
+        em_norm = norm_id(em)
         cpf = info['cpf']
         total_num = so_digitos(info['total_documentos'])
         docs_raw = info['documentos']
@@ -321,9 +400,9 @@ for row in listaDeAlunos.iter_rows(min_row=2, max_row=listaDeAlunos.max_row, min
         docs_normalizados_lista = list(mapa_contagens.keys())
         status = status_pesquisa(documento, docs_normalizados_lista)
 
-        # Colunas fixas F..I com “Pendente” se ausentes
+        # Colunas fixas F..I com “Pendente” se ausentes (por nome-base)
         def texto_doc_fixo(rotulo):
-            qtd = mapa_contagens.get(rotulo, 0)
+            qtd = mapa_contagens.get(_doc_base_name(rotulo), 0)
             if qtd == 0:
                 return "Pendente"
             return f"{rotulo} ({qtd})" if qtd > 1 else rotulo
@@ -333,16 +412,37 @@ for row in listaDeAlunos.iter_rows(min_row=2, max_row=listaDeAlunos.max_row, min
         col_H = texto_doc_fixo(COL_FIXA_H)
         col_I = texto_doc_fixo(COL_FIXA_I)
 
-        # Remove dos “extras” os que já entraram nas colunas fixas
+        # Extras = tudo que não é uma das 4 colunas fixas (por base name)
         extras = [d for d in docs_agregados
-                  if normaliza_titulo(d).split(" (")[0] not in {
-                      COL_FIXA_F, COL_FIXA_G, COL_FIXA_H, COL_FIXA_I
+                  if _doc_base_name(d).split(" (")[0] not in {
+                      _doc_base_name(COL_FIXA_F),
+                      _doc_base_name(COL_FIXA_G),
+                      _doc_base_name(COL_FIXA_H),
+                      _doc_base_name(COL_FIXA_I),
                   }]
 
         garantir_cabecalho_docs(len(extras))
-        linha = [nome, em, cpf, total_num, status, col_F, col_G, col_H, col_I] + extras
-        ws_out.append(linha)
-        wb_out.save(OUT_PATH)
+
+        # Checagem final anti-duplicidade (outra execução paralela)
+        if em_norm in processados_saida_norm:
+            print(f"⚠️ Durante o processamento, o ID {em_norm} apareceu no RESULTADO.xlsx. Ignorando para não duplicar.")
+            ws_log.append([ws_log.max_row, nid, em_norm, nome, 'SKIPPED_DUP_RESULT', 'já estava no arquivo'])
+            salvar_resultado_com_retry()
+        else:
+            linha = [nome, em, cpf, total_num, status, col_F, col_G, col_H, col_I] + extras
+            ws_out.append(linha)
+            ok = salvar_resultado_com_retry()
+            if ok:
+                processados_saida_norm.add(em_norm)
+                ids_ok_norm.add(em_norm)
+                vistos_execucao_norm.add(nid)
+                ws_log.append([ws_log.max_row, nid, em_norm, nome, 'APPENDED', 'gravado com sucesso'])
+                salvar_resultado_com_retry()
+            else:
+                # não conseguiu salvar → marca para retry
+                ids_falha_norm.append(nid)
+                ws_log.append([ws_log.max_row, nid, em_norm, nome, 'ERROR_SAVE', 'falha ao salvar; vai para retry'])
+                salvar_resultado_com_retry()
 
         print("====================================")
         print(f"Nome: {nome}")
@@ -355,16 +455,11 @@ for row in listaDeAlunos.iter_rows(min_row=2, max_row=listaDeAlunos.max_row, min
             print("Extras:", ", ".join(extras))
 
     except Exception as e:
-        print(f"Erro no processamento desse ID {current_id}: {e}")
-        try:
-            # Linha mínima com pendências nas fixas
-            ws_out.append([None, current_id, None, 0, "Não Encontrado",
-                           "Pendente", "Pendente", "Pendente", "Pendente"])
-            wb_out.save(OUT_PATH)
-        except Exception:
-            pass
+        print(f"Erro no processamento desse ID {nid}: {e}")
+        ids_falha_norm.append(nid)
+        ws_log.append([ws_log.max_row, nid, None, None, 'ERROR_FETCH', str(e)[:120]])
+        salvar_resultado_com_retry()
     finally:
-        # Volta para a tela de pesquisa
         try:
             voltar_para_pesquisa(timeout=20)
         except Exception:
@@ -375,4 +470,126 @@ for row in listaDeAlunos.iter_rows(min_row=2, max_row=listaDeAlunos.max_row, min
             except Exception:
                 print("Aviso: não consegui voltar à tela de pesquisa automaticamente.")
 
-print(f"✅ Finalizado. Saída em: {OUT_PATH}")
+# ================== LOOP DE RETENTATIVA (Rodada 2) ==================
+if ids_falha_norm:
+    print("\n🔁 Iniciando rodada de retry para IDs que falharam...\n")
+    ids_retry_norm = [i for i in ids_falha_norm if i not in processados_saida_norm]
+
+    for nid in ids_retry_norm:
+        try:
+            colocar_assim_aparecer(By.CSS_SELECTOR, 'input[data-v-bc1d237e]', nid)
+            clicar_assim_aparecer(By.XPATH, '//*[@id="app"]/div/div/div[2]/main/div/div/div[2]/div/div[1]/div/button')
+
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '#sn-table-desk tbody tr'))
+            )
+            clicar_visualizar_primeira_linha(timeout=20)
+            abrir_dropdown_todos_documentos(timeout=12)
+
+            info = scrape_prontuario(driver, timeout=15)
+
+            nome = info['nome']
+            em = info['id']
+            em_norm = norm_id(em)
+            cpf = info['cpf']
+            total_num = so_digitos(info['total_documentos'])
+            docs_raw = info['documentos']
+
+            docs_agregados, mapa_contagens = agrega_docs(docs_raw)
+            docs_normalizados_lista = list(mapa_contagens.keys())
+            status = status_pesquisa(documento, docs_normalizados_lista)
+
+            def texto_doc_fixo(rotulo):
+                qtd = mapa_contagens.get(_doc_base_name(rotulo), 0)
+                if qtd == 0:
+                    return "Pendente"
+                return f"{rotulo} ({qtd})" if qtd > 1 else rotulo
+
+            col_F = texto_doc_fixo(COL_FIXA_F)
+            col_G = texto_doc_fixo(COL_FIXA_G)
+            col_H = texto_doc_fixo(COL_FIXA_H)
+            col_I = texto_doc_fixo(COL_FIXA_I)
+
+            extras = [d for d in docs_agregados
+                      if _doc_base_name(d).split(" (")[0] not in {
+                          _doc_base_name(COL_FIXA_F),
+                          _doc_base_name(COL_FIXA_G),
+                          _doc_base_name(COL_FIXA_H),
+                          _doc_base_name(COL_FIXA_I),
+                      }]
+            garantir_cabecalho_docs(len(extras))
+
+            if em_norm in processados_saida_norm:
+                print(f"⚠️ ID {em_norm} foi preenchido por outra execução. Pulando.")
+                ws_log.append([ws_log.max_row, nid, em_norm, nome, 'RETRY_SKIP_DUP', 'já estava no arquivo'])
+                salvar_resultado_com_retry()
+            else:
+                ws_out.append([nome, em, cpf, total_num, status, col_F, col_G, col_H, col_I] + extras)
+                ok = salvar_resultado_com_retry()
+                if ok:
+                    processados_saida_norm.add(em_norm)
+                    ids_ok_norm.add(em_norm)
+                    vistos_execucao_norm.add(nid)
+                    ws_log.append([ws_log.max_row, nid, em_norm, nome, 'RETRY_OK', 'gravado no retry'])
+                    salvar_resultado_com_retry()
+                else:
+                    ws_log.append([ws_log.max_row, nid, em_norm, nome, 'RETRY_ERROR_SAVE', 'falha ao salvar no retry'])
+                    salvar_resultado_com_retry()
+
+        except Exception as e:
+            print(f"❌ Retry falhou para {nid}: {e}")
+            ws_log.append([ws_log.max_row, nid, None, None, 'RETRY_FAIL', str(e)[:120]])
+            salvar_resultado_com_retry()
+        finally:
+            try:
+                voltar_para_pesquisa(timeout=20)
+            except Exception:
+                try:
+                    driver.back(); time.sleep(0.8)
+                    driver.back(); time.sleep(0.8)
+                    voltar_para_pesquisa(timeout=20)
+                except Exception:
+                    pass
+
+# ================== AUDITORIA FINAL ==================
+esperados = set(ids_entrada_unicos_norm)
+existentes = set(processados_saida_norm)
+
+faltantes = sorted(list(esperados - existentes))      # “pulou”/não conseguiu fazer
+entrada_dupes = sorted(list(duplicados_entrada_norm)) # duplicados na ALUNOS.xlsx
+
+print("\n===== VERIFICAÇÃO FINAL =====")
+print(f"Total na entrada (linhas com ID): {len(ids_entrada_norm)}")
+print(f"IDs únicos na entrada: {len(esperados)}")
+print(f"Já estavam feitos antes de rodar: {len(processados_saida_norm - ids_ok_norm)}")
+print(f"Concluídos nesta execução: {len(ids_ok_norm)}")
+print(f"Duplicados na entrada (ALUNOS.xlsx): {len(entrada_dupes)}")
+if entrada_dupes:
+    print("• IDs duplicados na entrada:", ", ".join(map(str, entrada_dupes)))
+
+print(f"Ficaram faltando (não gravados no RESULTADO.xlsx): {len(faltantes)}")
+if faltantes:
+    print("• IDs faltantes:", ", ".join(map(str, faltantes)))
+    # Gravar guia de auditoria
+    try:
+        if 'AUDITORIA' not in wb_out.sheetnames:
+            wb_out.create_sheet('AUDITORIA')
+        ws_aud = wb_out['AUDITORIA']
+        ws_aud.delete_rows(1, ws_aud.max_row)  # limpa
+        ws_aud.append(['Tipo', 'ID'])
+        for _id in entrada_dupes:
+            ws_aud.append(['Duplicado na entrada', _id])
+        for _id in faltantes:
+            ws_aud.append(['Faltante (não processado)', _id])
+        salvar_resultado_com_retry()
+        print("📄 Guia 'AUDITORIA' atualizada no RESULTADO.xlsx.")
+    except Exception as e:
+        print(f"Não consegui atualizar guia AUDITORIA: {e}")
+
+# Encerrar o driver de forma limpa
+try:
+    driver.quit()
+except Exception:
+    pass
+
+print(f"\n✅ Finalizado. Saída em: {OUT_PATH}")
